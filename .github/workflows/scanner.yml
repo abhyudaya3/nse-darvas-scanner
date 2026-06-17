@@ -2,8 +2,8 @@ name: NSE Darvas Box Scanner
 
 on:
   schedule:
-    # Run Mon–Fri at 16:30 IST (11:00 UTC) – 30 min after NSE close
-    - cron: '0 11 * * 1-5'
+    # Mon–Fri at 11:05 UTC = 4:35 PM IST (market closes 3:30 PM IST)
+    - cron: '5 11 * * 1-5'
   workflow_dispatch:
     inputs:
       full_refresh:
@@ -24,6 +24,10 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+      debug_symbol:
+        description: 'Debug single symbol (e.g. RELIANCE) — skips full scan'
+        required: false
+        default: ''
 
 jobs:
   scan:
@@ -41,30 +45,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Restore data cache ─────────────────────────────────────────────────
-      - name: Restore price data cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/daily
-            data/nse_symbols.json
-          key: nse-daily-${{ runner.os }}-${{ hashFiles('data/nse_symbols.json') }}
-          restore-keys: |
-            nse-daily-${{ runner.os }}-
-
-      # ── 3. Restore SQLite database ────────────────────────────────────────────
-      - name: Restore database artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/signals.db
-            data/watchlist.db
-            data/telegram_sent.json
-          key: nse-db-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            nse-db-${{ runner.os }}-
-
-      # ── 4. Python setup ───────────────────────────────────────────────────────
+      # ── 2. Python setup ───────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -76,8 +57,40 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 5. Run scanner ────────────────────────────────────────────────────────
+      # ── 3. Restore Parquet price cache ────────────────────────────────────────
+      #    Key includes date so stale caches auto-expire after 7 days
+      - name: Restore price data cache
+        uses: actions/cache/restore@v4
+        id: cache-price
+        with:
+          path: data/daily
+          key: nse-daily-${{ runner.os }}-${{ hashFiles('data/nse_symbols.json') }}-${{ github.run_number }}
+          restore-keys: |
+            nse-daily-${{ runner.os }}-
+
+      # ── 4. Restore database ───────────────────────────────────────────────────
+      - name: Restore database
+        uses: actions/cache/restore@v4
+        id: cache-db
+        with:
+          path: |
+            data/signals.db
+            data/watchlist.db
+            data/nse_symbols.json
+            data/telegram_sent.json
+          key: nse-db-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            nse-db-${{ runner.os }}-
+
+      # ── 5a. Debug mode (single symbol) ───────────────────────────────────────
+      - name: Debug single symbol
+        if: ${{ github.event.inputs.debug_symbol != '' }}
+        run: |
+          python main.py --debug-symbol "${{ github.event.inputs.debug_symbol }}"
+
+      # ── 5b. Full scan ─────────────────────────────────────────────────────────
       - name: Run Darvas Box Scanner
+        if: ${{ github.event.inputs.debug_symbol == '' }}
         run: |
           ARGS=""
           [ "${{ github.event.inputs.full_refresh }}"     = "true" ] && ARGS="$ARGS --full-refresh"
@@ -85,8 +98,8 @@ jobs:
           [ "${{ github.event.inputs.no_telegram }}"      = "true" ] && ARGS="$ARGS --no-telegram"
           python main.py $ARGS
 
-      # ── 6. Upload reports artifact ────────────────────────────────────────────
-      - name: Upload Excel report
+      # ── 6. Upload Excel report ────────────────────────────────────────────────
+      - name: Upload report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -94,8 +107,8 @@ jobs:
           path: reports/
           retention-days: 90
 
-      # ── 7. Upload logs artifact ───────────────────────────────────────────────
-      - name: Upload logs
+      # ── 7. Upload logs ────────────────────────────────────────────────────────
+      - name: Upload logs artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -103,7 +116,15 @@ jobs:
           path: logs/
           retention-days: 30
 
-      # ── 8. Save updated DB back to cache ─────────────────────────────────────
+      # ── 8. Save price cache ───────────────────────────────────────────────────
+      - name: Save price data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/daily
+          key: nse-daily-${{ runner.os }}-${{ hashFiles('data/nse_symbols.json') }}-${{ github.run_number }}
+
+      # ── 9. Save database ──────────────────────────────────────────────────────
       - name: Save database cache
         if: always()
         uses: actions/cache/save@v4
@@ -111,15 +132,6 @@ jobs:
           path: |
             data/signals.db
             data/watchlist.db
+            data/nse_symbols.json
             data/telegram_sent.json
           key: nse-db-${{ runner.os }}-${{ github.run_number }}
-
-      # ── 9. Save updated price cache ───────────────────────────────────────────
-      - name: Save price data cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            data/daily
-            data/nse_symbols.json
-          key: nse-daily-${{ runner.os }}-${{ hashFiles('data/nse_symbols.json') }}
