@@ -1,0 +1,150 @@
+name: NSE Darvas Box Backtester
+
+# This workflow is SEPARATE from the daily scanner (scanner.yml).
+# It is manually triggered (workflow_dispatch) — it does NOT run on a
+# schedule, since backtests are something you run on-demand when you
+# want to validate the strategy or check accumulated forward results,
+# not something that needs to happen every day.
+#
+# It shares the SAME data/daily Parquet cache and SAME signals.db as
+# the daily scanner workflow, via the same cache keys, so:
+#   - Backward backtest uses whatever price history the daily scanner
+#     has already downloaded (no separate data fetch needed in most cases)
+#   - Forward report reads the same signals.db that the daily scanner
+#     has been writing real signals into every weekday
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which backtest to run'
+        required: true
+        default: 'forward_report'
+        type: choice
+        options:
+          - 'backward_all'        # Full universe backward backtest
+          - 'backward_limited'    # Backward backtest on first N symbols (quick test)
+          - 'forward_report'      # Print forward-validation report from real signals
+      backtest_limit:
+        description: 'Symbol limit for backward_limited mode (e.g. 200)'
+        required: false
+        default: '200'
+      refresh_data_first:
+        description: 'Run a data download/update before backtesting (slower, but ensures fresh data)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    env:
+      ACCOUNT_SIZE: ${{ vars.ACCOUNT_SIZE || '1000000' }}
+      RISK_PCT:     ${{ vars.RISK_PCT || '1.0' }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ───────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 3. Restore Parquet price cache (same cache as daily scanner) ─────────
+      #    restore-keys prefix match pulls the MOST RECENT cache saved by
+      #    either this workflow or scanner.yml — they share the same prefix.
+      - name: Restore price data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/daily
+          key: nse-daily-${{ runner.os }}-restore-only
+          restore-keys: |
+            nse-daily-${{ runner.os }}-
+
+      # ── 4. Restore database (signals.db has the real forward-tracked signals) ─
+      - name: Restore database
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/signals.db
+            data/watchlist.db
+            data/nse_symbols.json
+          key: nse-db-${{ runner.os }}-restore-only
+          restore-keys: |
+            nse-db-${{ runner.os }}-
+
+      # ── 5. Optionally refresh price data first ────────────────────────────────
+      - name: Update price data (optional)
+        if: ${{ github.event.inputs.refresh_data_first == 'true' }}
+        run: |
+          python main.py --no-telegram --refresh-universe
+        continue-on-error: false
+
+      # ── 6a. Backward backtest — full universe ─────────────────────────────────
+      - name: Run backward backtest (full universe)
+        if: ${{ github.event.inputs.mode == 'backward_all' }}
+        run: |
+          python main.py --backtest-all
+
+      # ── 6b. Backward backtest — limited (quick test) ──────────────────────────
+      - name: Run backward backtest (limited)
+        if: ${{ github.event.inputs.mode == 'backward_limited' }}
+        run: |
+          python main.py --backtest-all --backtest-limit "${{ github.event.inputs.backtest_limit }}"
+
+      # ── 6c. Forward validation report ──────────────────────────────────────────
+      - name: Run forward validation report
+        if: ${{ github.event.inputs.mode == 'forward_report' }}
+        run: |
+          python main.py --forward-report | tee reports/forward_validation_summary.txt
+
+      # ── 7. Upload backtest reports ────────────────────────────────────────────
+      - name: Upload backtest report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: darvas-backtest-${{ github.run_number }}
+          path: reports/
+          retention-days: 180
+
+      # ── 8. Upload logs ────────────────────────────────────────────────────────
+      - name: Upload logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: darvas-backtest-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
+
+      # ── 9. Save database back (backtest_runs / backtest_trades tables updated) ─
+      #    Uses the SAME cache key prefix as scanner.yml so both workflows
+      #    keep contributing to the same persistent signals.db over time.
+      - name: Save database cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/signals.db
+            data/watchlist.db
+            data/nse_symbols.json
+          key: nse-db-${{ runner.os }}-backtest-${{ github.run_number }}
+
+      # ── 10. Save price cache if it was refreshed ──────────────────────────────
+      - name: Save price data cache
+        if: ${{ github.event.inputs.refresh_data_first == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: data/daily
+          key: nse-daily-${{ runner.os }}-${{ hashFiles('data/nse_symbols.json') }}-backtest-${{ github.run_number }}
