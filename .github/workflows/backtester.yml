@@ -128,7 +128,7 @@ jobs:
           path: logs/
           retention-days: 30
 
-      # ── 9. Save database back (backtest_runs / backtest_trades tables updated) ─
+      # ── 9. Save database back (backtest_runs / backtest_symbol_summary / backtest_trade_log tables updated) ─
       #    Uses the SAME cache key prefix as scanner.yml so both workflows
       #    keep contributing to the same persistent signals.db over time.
       - name: Save database cache
